@@ -71,6 +71,35 @@ pub struct Verdict {
     pub votes: Vec<Vote>,
 }
 
+impl Verdict {
+    /// Build a verdict from raw ballots. `approve_value` is the ballot string
+    /// counted as approval (e.g. `"approve"`, `"yes"`). `mean` is the approval
+    /// fraction, `dissent` the non-approval fraction, `decision` `"approve"`
+    /// iff every ballot approved. An empty ballot list is not unanimous.
+    pub fn from_votes(votes: Vec<Vote>, approve_value: &str, summary: impl Into<String>) -> Self {
+        let total = votes.len();
+        let approvals = votes.iter().filter(|v| v.vote == approve_value).count();
+        let mean = if total == 0 {
+            0.0
+        } else {
+            approvals as f64 / total as f64
+        };
+        Self {
+            decision: if total > 0 && approvals == total {
+                "approve"
+            } else {
+                "mixed"
+            }
+            .into(),
+            mean,
+            dissent: 1.0 - mean,
+            unanimous_approve: total > 0 && approvals == total,
+            summary: summary.into(),
+            votes,
+        }
+    }
+}
+
 /// A signature produced over the canonical artifact at ratification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signature {
@@ -84,6 +113,50 @@ pub struct Signature {
 /// Implementations: Secure Enclave agent, Ed25519 key, HSM, remote signer.
 pub trait Signer: Send + Sync {
     fn sign(&self, canonical: &[u8]) -> Option<Signature>;
+}
+
+/// Software Ed25519 signer (feature `ed25519`). For hardware-backed keys
+/// (Secure Enclave, TPM, HSM) implement [`Signer`] yourself — the trait is
+/// deliberately small so any attestation path can plug in.
+#[cfg(feature = "ed25519")]
+pub struct Ed25519Signer {
+    keypair: ed25519_dalek::SigningKey,
+}
+
+#[cfg(feature = "ed25519")]
+impl Ed25519Signer {
+    /// Generate a fresh keypair.
+    pub fn generate() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        Self::from_bytes(&secret)
+    }
+
+    /// Wrap an existing 32-byte secret.
+    pub fn from_bytes(secret: &[u8; 32]) -> Self {
+        Self {
+            keypair: ed25519_dalek::SigningKey::from_bytes(secret),
+        }
+    }
+
+    /// Hex-encoded public key.
+    pub fn pubkey_hex(&self) -> String {
+        hex::encode(self.keypair.verifying_key().to_bytes())
+    }
+}
+
+#[cfg(feature = "ed25519")]
+impl Signer for Ed25519Signer {
+    fn sign(&self, canonical: &[u8]) -> Option<Signature> {
+        use ed25519_dalek::Signer as _;
+        let sig = self.keypair.sign(canonical);
+        Some(Signature {
+            scheme: "ed25519".into(),
+            pubkey: self.pubkey_hex(),
+            sig: hex::encode(sig.to_bytes()),
+        })
+    }
 }
 
 /// Optional sink for lifecycle events (audit ledger, flight tape, logs).
@@ -586,6 +659,56 @@ impl Constitution {
         Ok(out)
     }
 
+    /// Journal entries for one amendment, in order — its provenance
+    /// timeline: proposed, deliberated, ratified, applied, measured, ...
+    pub fn history(&self, id: &str) -> Result<Vec<Map<String, Value>>> {
+        let text = match fs::read_to_string(&self.journal_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["amendment_id"].as_str() == Some(id))
+            .filter_map(|v| v.as_object().cloned())
+            .collect())
+    }
+
+    /// Verify an artifact file against the journal's most recent committed
+    /// `artifact_sha256` for that amendment. The journal commits the artifact
+    /// hash at every transition — a file that no longer hashes to its last
+    /// committed state has been modified outside the lifecycle.
+    pub fn verify_artifact(&self, id: &str) -> Result<()> {
+        let amendment = self.load(id).ok_or_else(|| Error::Missing(id.into()))?;
+        let history = self.history(id)?;
+        let last = history.last().ok_or(Error::JournalCorrupt {
+            line: 0,
+            reason: format!("no journal entries for {id}"),
+        })?;
+        let committed = last["artifact_sha256"].as_str().unwrap_or("");
+        let value = serde_json::to_value(&amendment)?;
+        let actual = sha256_hex(&canonical(&value));
+        if actual != committed {
+            return Err(Error::JournalCorrupt {
+                line: 0,
+                reason: format!("artifact {id} hashes {actual}, journal committed {committed}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify the journal chain AND every artifact's committed hash.
+    /// The complete integrity pass.
+    pub fn verify_all(&self) -> Result<()> {
+        self.verify_journal()?;
+        for amendment in self.list(usize::MAX)? {
+            self.verify_artifact(&amendment.id)?;
+        }
+        Ok(())
+    }
+
     /// Re-verify the hash-chained journal end to end: every entry's hash
     /// recomputes and every `prev_hash` links to its predecessor.
     pub fn verify_journal(&self) -> Result<()> {
@@ -719,6 +842,75 @@ mod tests {
         assert_eq!(c.load(&id).unwrap().ratified_by.as_deref(), Some("human"));
         c.verify_journal().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_tamper_detected() {
+        let dir = std::env::temp_dir().join(format!("xipe-test-at-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let c = constitution(&dir);
+        let id = c.propose("x", json!({}), "me").unwrap();
+        c.record_verdict(&id, &unanimous()).unwrap();
+        c.verify_artifact(&id).unwrap();
+        // Forge the artifact on disk — status flipped behind the journal's back.
+        let path = dir.join(format!("{id}.json"));
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("ratified", "applied");
+        fs::write(&path, text).unwrap();
+        assert!(matches!(
+            c.verify_artifact(&id),
+            Err(Error::JournalCorrupt { .. })
+        ));
+        assert!(matches!(c.verify_all(), Err(Error::JournalCorrupt { .. })));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_returns_ordered_transitions() {
+        let dir = std::env::temp_dir().join(format!("xipe-test-hi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let c = constitution(&dir);
+        let id = c.propose("x", json!({}), "me").unwrap();
+        c.record_verdict(&id, &unanimous()).unwrap();
+        c.mark_applied(&id, json!({})).unwrap();
+        let history = c.history(&id).unwrap();
+        let transitions: Vec<_> = history
+            .iter()
+            .filter_map(|e| e["transition"].as_str())
+            .collect();
+        assert_eq!(
+            transitions,
+            vec!["proposed", "deliberated+ratified", "applied"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_votes_computes_unanimity_and_dissent() {
+        let approve = |seat: &str| Vote {
+            seat: seat.into(),
+            vote: "approve".into(),
+            rationale: String::new(),
+        };
+        let deny = Vote {
+            seat: "d".into(),
+            vote: "deny".into(),
+            rationale: "risk".into(),
+        };
+        let v = Verdict::from_votes(
+            vec![approve("a"), approve("b"), approve("c")],
+            "approve",
+            "3/3",
+        );
+        assert!(v.unanimous_approve);
+        assert_eq!(v.mean, 1.0);
+        let v = Verdict::from_votes(vec![approve("a"), deny, approve("c")], "approve", "2/3");
+        assert!(!v.unanimous_approve);
+        assert!((v.mean - 0.666).abs() < 0.01);
+        assert!((v.dissent - 0.333).abs() < 0.01);
+        // Empty quorum never ratifies itself.
+        assert!(!Verdict::from_votes(vec![], "approve", "").unanimous_approve);
     }
 
     #[test]
