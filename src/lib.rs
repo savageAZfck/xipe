@@ -420,8 +420,7 @@ impl Constitution {
             return "genesis".into();
         };
         text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
+            .rfind(|l| !l.trim().is_empty())
             .and_then(|l| serde_json::from_str::<Value>(l).ok())
             .and_then(|v| v["entry_hash"].as_str().map(String::from))
             .unwrap_or_else(|| "genesis".into())
